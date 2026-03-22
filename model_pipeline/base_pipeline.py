@@ -1,3 +1,4 @@
+import pandas as pd
 import tensorflow as tf
 import tensorflow.keras as keras
 from tensorflow.keras import layers
@@ -9,8 +10,13 @@ import kagglehub
 #load data
 path = kagglehub.dataset_download("arpitjain007/game-of-deep-learning-ship-datasets")
 
-TRAIN_DIR = os.path.join(path, "train")
-TEST_DIR  = os.path.join(path, "test")
+TRAIN_CSV = os.path.join(path, "train", "train.csv")
+TEST_CSV  = os.path.join(path, "test_ApKoW4T.csv")
+IMAGE_DIR = os.path.join(path, "train", "images")   # folder containing all images
+
+# If your CSV uses different column names, change these:
+IMAGE_COL = "image"   # e.g. "filename", "img", "id", etc.
+LABEL_COL = "category"   # e.g. "category", "class", etc.
 
 #config
 IMG_SIZE = (224, 224)
@@ -20,27 +26,73 @@ EPOCHS = 15
 MODEL_TYPE = "cnn"  # "cnn" or "vit"
 
 #preprocessing
-def load_datasets(train_dir, img_size, batch_size):
-    train_ds = tf.keras.utils.image_dataset_from_directory(
-        train_dir,
-        validation_split=0.2,
-        subset="training",
-        seed=42,
-        image_size=img_size,
-        batch_size=batch_size
-    )
+def decode_and_resize(image_path, img_size=IMG_SIZE):
+    image_bytes = tf.io.read_file(image_path)
+    image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+    image = tf.image.resize(image, img_size)
+    image = tf.cast(image, tf.float32)
+    return image
 
-    val_ds = tf.keras.utils.image_dataset_from_directory(
-        train_dir,
-        validation_split=0.2,
-        subset="validation",
-        seed=42,
-        image_size=img_size,
-        batch_size=batch_size
-    )
+def load_image_with_label(image_path, label):
+    image = decode_and_resize(image_path)
+    return image, label
 
-    class_names = train_ds.class_names
+def load_image_only(image_path):
+    image = decode_and_resize(image_path)
+    return image
+
+def make_paths_from_csv(df, image_root, image_col):
+    # If the CSV already stores full paths, this still works because os.path.join
+    # will keep the absolute path if image_col is absolute.
+    return df[image_col].apply(lambda x: os.path.join(image_root, str(x))).tolist()
+
+def load_datasets_from_csv(
+    train_csv,
+    image_root,
+    img_size,
+    batch_size,
+    image_col="image",
+    label_col="category",
+    val_split=0.2,
+    seed=42
+):
+    df = pd.read_csv(train_csv)
+
+    # Shuffle before splitting
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    # Build label vocabulary from training CSV
+    class_names = sorted(df[label_col].astype(str).unique().tolist())
+    label_lookup = layers.StringLookup(vocabulary=class_names, num_oov_indices=0)
+
+    # Train/validation split
+    val_size = int(len(df) * val_split)
+    val_df = df.iloc[:val_size].copy()
+    train_df = df.iloc[val_size:].copy()
+
+    train_paths = make_paths_from_csv(train_df, image_root, image_col)
+    val_paths   = make_paths_from_csv(val_df, image_root, image_col)
+
+    train_labels = train_df[label_col].astype(str).tolist()
+    val_labels   = val_df[label_col].astype(str).tolist()
+
+    train_labels = label_lookup(tf.constant(train_labels))
+    val_labels   = label_lookup(tf.constant(val_labels))
+
+    train_ds = tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
+    val_ds   = tf.data.Dataset.from_tensor_slices((val_paths, val_labels))
+
+    train_ds = train_ds.map(load_image_with_label, num_parallel_calls=AUTOTUNE)
+    val_ds   = val_ds.map(load_image_with_label, num_parallel_calls=AUTOTUNE)
+
     return train_ds, val_ds, class_names
+
+def load_test_dataset(test_csv, image_root, image_col="image"):
+    df = pd.read_csv(test_csv)
+    test_paths = make_paths_from_csv(df, image_root, image_col)
+    test_ds = tf.data.Dataset.from_tensor_slices(test_paths)
+    test_ds = test_ds.map(load_image_only, num_parallel_calls=AUTOTUNE)
+    return test_ds, df
 
 #normalization
 normalization_layer = layers.Rescaling(1./255)
@@ -61,6 +113,7 @@ def prepare(ds, training=False):
         ds = ds.map(lambda x, y: (data_augmentation(x), y),
                     num_parallel_calls=AUTOTUNE)
 
+    ds = ds.batch(BATCH_SIZE)
     return ds.prefetch(AUTOTUNE)
 
 #model architectures, both CNN and Vit
@@ -161,7 +214,7 @@ callbacks = [
     keras.callbacks.ModelCheckpoint("best_model.keras", save_best_only=True)
 ]
 
-train_ds, val_ds, class_names = load_datasets(TRAIN_DIR, IMG_SIZE, BATCH_SIZE)
+train_ds, val_ds, class_names = load_datasets_from_csv(TRAIN_CSV, IMAGE_DIR, IMG_SIZE, BATCH_SIZE)
 
 train_ds = prepare(train_ds, training=True)
 val_ds   = prepare(val_ds, training=False)
