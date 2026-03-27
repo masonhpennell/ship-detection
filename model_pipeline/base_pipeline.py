@@ -1,4 +1,5 @@
-import pandas as pd
+from pandas import read_csv
+import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow.keras as keras
 from tensorflow.keras import layers
@@ -14,16 +15,20 @@ TRAIN_CSV = os.path.join(path, "train", "train.csv")
 TEST_CSV  = os.path.join(path, "test_ApKoW4T.csv")
 IMAGE_DIR = os.path.join(path, "train", "images")   # folder containing all images
 
-# If your CSV uses different column names, change these:
-IMAGE_COL = "image"   # e.g. "filename", "img", "id", etc.
-LABEL_COL = "category"   # e.g. "category", "class", etc.
-
 #config
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
-EPOCHS = 15
-MODEL_TYPE = "cnn"  # "cnn" or "vit"
+EPOCHS = 1
+MODEL_TYPE = "transfer"  # "cnn", "vit", or "transfer"
+INITIAL_LR = 1e-4
+FINE_TUNE_LR = 1e-5
+
+# transfer learning config
+TRANSFER_WEIGHTS = "imagenet"
+TRANSFER_DROPOUT = 0.2
+FINE_TUNE_EPOCHS = 1
+UNFREEZE_AT = 100
 
 #preprocessing
 def decode_and_resize(image_path, img_size=IMG_SIZE):
@@ -56,7 +61,7 @@ def load_datasets_from_csv(
     val_split=0.2,
     seed=42
 ):
-    df = pd.read_csv(train_csv)
+    df = read_csv(train_csv)
 
     # Shuffle before splitting
     df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
@@ -88,7 +93,7 @@ def load_datasets_from_csv(
     return train_ds, val_ds, class_names
 
 def load_test_dataset(test_csv, image_root, image_col="image"):
-    df = pd.read_csv(test_csv)
+    df = read_csv(test_csv)
     test_paths = make_paths_from_csv(df, image_root, image_col)
     test_ds = tf.data.Dataset.from_tensor_slices(test_paths)
     test_ds = test_ds.map(load_image_only, num_parallel_calls=AUTOTUNE)
@@ -106,10 +111,11 @@ data_augmentation = keras.Sequential([
 ])
 
 def prepare(ds, training=False):
-    ds = ds.map(lambda x, y: (normalization_layer(x), y),
-                num_parallel_calls=AUTOTUNE)
+    if MODEL_TYPE != "transfer":
+        ds = ds.map(lambda x, y: (normalization_layer(x), y),
+                    num_parallel_calls=AUTOTUNE)
 
-    if training:
+    if training and MODEL_TYPE != "transfer":
         ds = ds.map(lambda x, y: (data_augmentation(x), y),
                     num_parallel_calls=AUTOTUNE)
 
@@ -199,10 +205,36 @@ def build_vit_model(num_classes):
 
     return keras.Model(inputs=inputs, outputs=outputs)
 
+def build_transfer_model(
+    num_classes,
+    weights=TRANSFER_WEIGHTS,
+    dropout=TRANSFER_DROPOUT
+):
+    backbone_cls = tf.keras.applications.MobileNetV2
+    preprocess_input = tf.keras.applications.mobilenet_v2.preprocess_input
+
+    base_model = backbone_cls(
+        input_shape=IMG_SIZE + (3,),
+        include_top=False,
+        weights=weights
+    )
+    base_model.trainable = False
+
+    inputs = keras.Input(shape=IMG_SIZE + (3,))
+    x = data_augmentation(inputs)
+    x = preprocess_input(x)
+    x = base_model(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(dropout)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    model = keras.Model(inputs, outputs)
+    return model, base_model
+
 #training
-def compile_model(model):
+def compile_model(model, learning_rate=INITIAL_LR):
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"]
     )
@@ -221,10 +253,12 @@ val_ds   = prepare(val_ds, training=False)
 
 num_classes = len(class_names)
 
-if MODEL_TYPE == "cnn":
-    model = build_cnn_model(num_classes)
+if   MODEL_TYPE == "cnn": model = build_cnn_model(num_classes)
+elif MODEL_TYPE == "vit": model = build_vit_model(num_classes)
+elif MODEL_TYPE == "transfer":
+    model, base_model = build_transfer_model(num_classes)
 else:
-    model = build_vit_model(num_classes)
+    raise ValueError("MODEL_TYPE must be one of: cnn, vit, transfer")
 
 model = compile_model(model)
 
@@ -234,6 +268,21 @@ history = model.fit(
     epochs=EPOCHS,
     callbacks=callbacks
 )
+
+if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
+    base_model.trainable = True
+    for layer in base_model.layers[:UNFREEZE_AT]:
+        layer.trainable = False
+
+    model = compile_model(model, learning_rate=FINE_TUNE_LR)
+
+    history_fine = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS + FINE_TUNE_EPOCHS,
+        initial_epoch=history.epoch[-1] + 1,
+        callbacks=callbacks
+    )
 
 #eval
 loss, acc = model.evaluate(val_ds)
