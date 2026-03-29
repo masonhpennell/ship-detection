@@ -19,7 +19,7 @@ IMAGE_DIR = os.path.join(path, "train", "images")   # folder containing all imag
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
-EPOCHS = 1
+EPOCHS = 15
 MODEL_TYPE = "transfer"  # "cnn", "vit", or "transfer"
 INITIAL_LR = 1e-4
 FINE_TUNE_LR = 1e-5
@@ -27,7 +27,7 @@ FINE_TUNE_LR = 1e-5
 # transfer learning config
 TRANSFER_WEIGHTS = "imagenet"
 TRANSFER_DROPOUT = 0.2
-FINE_TUNE_EPOCHS = 1
+FINE_TUNE_EPOCHS = 15
 UNFREEZE_AT = 100
 
 #preprocessing
