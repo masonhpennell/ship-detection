@@ -6,14 +6,12 @@ from tensorflow.keras import layers
 import numpy as np
 import os
 
-import kagglehub
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-#load data
-path = kagglehub.dataset_download("arpitjain007/game-of-deep-learning-ship-datasets")
-
-TRAIN_CSV = os.path.join(path, "train", "train.csv")
-TEST_CSV  = os.path.join(path, "test_ApKoW4T.csv")
-IMAGE_DIR = os.path.join(path, "train", "images")   # folder containing all images
+# Dataset locations (relative to this file)
+TRAIN_CSV = os.path.join(BASE_DIR, "train.csv")
+TEST_CSV = os.path.join(BASE_DIR, "test.csv")
+IMAGE_DIR = os.path.join(BASE_DIR, "images")  # folder containing all images
 
 #config
 IMG_SIZE = (224, 224)
