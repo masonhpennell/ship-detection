@@ -5,6 +5,8 @@ import tensorflow.keras as keras
 from tensorflow.keras import layers
 import numpy as np
 import os
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
+import seaborn as sns
 
 import kagglehub
 
@@ -20,7 +22,7 @@ IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
 EPOCHS = 1
-MODEL_TYPE = "transfer"  # "cnn", "vit", or "transfer"
+MODEL_TYPE = "vit"  # "cnn", "vit", or "transfer"
 INITIAL_LR = 1e-4
 FINE_TUNE_LR = 1e-5
 
@@ -205,6 +207,7 @@ def build_vit_model(num_classes):
 
     return keras.Model(inputs=inputs, outputs=outputs)
 
+# Transfer
 def build_transfer_model(
     num_classes,
     weights=TRANSFER_WEIGHTS,
@@ -239,6 +242,38 @@ def compile_model(model, learning_rate=INITIAL_LR):
         metrics=["accuracy"]
     )
     return model
+
+# Evaluation
+def get_labels(model, dataset):
+    y_true = []
+    y_pred = []
+
+    for batch_images, batch_labels in dataset:
+        preds = model.predict(batch_images, verbose=0)
+        pred_labels = np.argmax(preds, axis=1)
+
+        y_true.extend(batch_labels.numpy())
+        y_pred.extend(pred_labels)
+
+    return np.array(y_true), np.array(y_pred)
+
+def plot_confusion_matrix(y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=class_names,
+        yticklabels=class_names
+    )
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
 
 callbacks = [
     keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
@@ -287,6 +322,16 @@ if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
 #eval
 loss, acc = model.evaluate(val_ds)
 print(f"Validation Accuracy: {acc:.4f}")
+
+y_true, y_pred = get_labels(model, val_ds)
+
+macro_f1 = f1_score(y_true, y_pred, average="macro")
+print(f"Macro F1-score: {macro_f1:.4f}")
+
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+plot_confusion_matrix(y_true, y_pred, class_names)
 
 #test predictions
 def predict_batch(model, dataset):
