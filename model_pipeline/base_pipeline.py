@@ -5,31 +5,27 @@ import tensorflow.keras as keras
 from tensorflow.keras import layers
 import numpy as np
 import os
-from sklearn.metrics import confusion_matrix, classification_report, f1_score
-import seaborn as sns
 
-import kagglehub
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-#load data
-path = kagglehub.dataset_download("arpitjain007/game-of-deep-learning-ship-datasets")
-
-TRAIN_CSV = os.path.join(path, "train", "train.csv")
-TEST_CSV  = os.path.join(path, "test_ApKoW4T.csv")
-IMAGE_DIR = os.path.join(path, "train", "images")   # folder containing all images
+# Dataset locations (relative to this file)
+TRAIN_CSV = os.path.join(BASE_DIR, "train.csv")
+TEST_CSV = os.path.join(BASE_DIR, "test.csv")
+IMAGE_DIR = os.path.join(BASE_DIR, "images")  # folder containing all images
 
 #config
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
-EPOCHS = 1
-MODEL_TYPE = "vit"  # "cnn", "vit", or "transfer"
+EPOCHS = 15
+MODEL_TYPE = "transfer"  # "cnn", "vit", or "transfer"
 INITIAL_LR = 1e-4
 FINE_TUNE_LR = 1e-5
 
 # transfer learning config
 TRANSFER_WEIGHTS = "imagenet"
 TRANSFER_DROPOUT = 0.2
-FINE_TUNE_EPOCHS = 1
+FINE_TUNE_EPOCHS = 15
 UNFREEZE_AT = 100
 
 #preprocessing
