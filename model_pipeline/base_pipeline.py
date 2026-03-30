@@ -291,12 +291,6 @@ def plot_confusion_matrix(y_true, y_pred, class_names):
     plt.tight_layout()
     plt.show()
 
-callbacks = [
-    keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-    keras.callbacks.ReduceLROnPlateau(patience=3),
-    keras.callbacks.ModelCheckpoint("best_model.keras", save_best_only=True)
-]
-
 train_ds, val_ds, class_names = load_datasets_from_csv(TRAIN_CSV, IMAGE_DIR, IMG_SIZE, BATCH_SIZE)
 
 train_ds = prepare(train_ds, training=True)
@@ -317,7 +311,6 @@ history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=EPOCHS,
-    callbacks=callbacks
 )
 
 if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
@@ -332,7 +325,6 @@ if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
         validation_data=val_ds,
         epochs=EPOCHS + FINE_TUNE_EPOCHS,
         initial_epoch=history.epoch[-1] + 1,
-        callbacks=callbacks
     )
 
 #eval
