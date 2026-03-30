@@ -143,6 +143,24 @@ def build_cnn_model(num_classes):
 
     return keras.Model(inputs=base_model.input, outputs=outputs)
 
+#Custom CNN (no pretrained models)
+def build_custom_cnn_model(num_classes):
+    inputs = layers.Input(shape=IMG_SIZE + (3,))
+
+    x = inputs
+    for filters in [32, 64, 128, 256]:
+        x = layers.Conv2D(filters, (3, 3), padding="same", use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    return keras.Model(inputs=inputs, outputs=outputs)
+
 #ViT
 class Patches(layers.Layer):
     def __init__(self, patch_size=16):
