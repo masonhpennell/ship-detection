@@ -5,6 +5,8 @@ import tensorflow.keras as keras
 from tensorflow.keras import layers
 import numpy as np
 import os
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
+import seaborn as sns
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -17,7 +19,7 @@ IMAGE_DIR = os.path.join(BASE_DIR, "images")  # folder containing all images
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
-EPOCHS = 15
+EPOCHS = 12
 MODEL_TYPE = "transfer"  # "cnn", "vit", or "transfer"
 INITIAL_LR = 1e-4
 FINE_TUNE_LR = 1e-5
@@ -25,15 +27,17 @@ FINE_TUNE_LR = 1e-5
 # transfer learning config
 TRANSFER_WEIGHTS = "imagenet"
 TRANSFER_DROPOUT = 0.2
-FINE_TUNE_EPOCHS = 15
+FINE_TUNE_EPOCHS = 10
 UNFREEZE_AT = 100
 
 #preprocessing
 def decode_and_resize(image_path, img_size=IMG_SIZE):
     image_bytes = tf.io.read_file(image_path)
     image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+    image.set_shape([None, None, 3])
     image = tf.image.resize(image, img_size)
     image = tf.cast(image, tf.float32)
+    image.set_shape(img_size + (3,))
     return image
 
 def load_image_with_label(image_path, label):
@@ -109,7 +113,7 @@ data_augmentation = keras.Sequential([
 ])
 
 def prepare(ds, training=False):
-    if MODEL_TYPE != "transfer":
+    if MODEL_TYPE == "vit":
         ds = ds.map(lambda x, y: (normalization_layer(x), y),
                     num_parallel_calls=AUTOTUNE)
 
@@ -125,7 +129,7 @@ def prepare(ds, training=False):
 def build_cnn_model(num_classes):
     base_model = tf.keras.applications.EfficientNetB0(
         include_top=False,
-        weights="imagenet",
+        weights=None,
         input_shape=IMG_SIZE + (3,)
     )
 
@@ -196,9 +200,8 @@ def build_vit_model(num_classes):
         encoded = layers.Add()([x3, x2])
 
     x = layers.LayerNormalization(epsilon=1e-6)(encoded)
-    x = layers.Flatten()(x)
+    x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dropout(0.5)(x)
-
     outputs = layers.Dense(num_classes, activation="softmax")(x)
 
     return keras.Model(inputs=inputs, outputs=outputs)
@@ -239,7 +242,7 @@ def compile_model(model, learning_rate=INITIAL_LR):
     )
     return model
 
-# Evaluation
+# Evaluation functions
 def get_labels(model, dataset):
     y_true = []
     y_pred = []
@@ -253,7 +256,7 @@ def get_labels(model, dataset):
 
     return np.array(y_true), np.array(y_pred)
 
-def plot_confusion_matrix(y_true, y_pred, class_names):
+def plot_confusion_matrix(filename, y_true, y_pred, class_names):
     cm = confusion_matrix(y_true, y_pred)
 
     plt.figure(figsize=(10, 8))
@@ -265,11 +268,23 @@ def plot_confusion_matrix(y_true, y_pred, class_names):
         xticklabels=class_names,
         yticklabels=class_names
     )
+
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
     plt.title("Confusion Matrix")
+
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.tight_layout()
     plt.show()
+
+# Writing to file processes from ChatGPT
+def save_results_to_file(filepath, content):
+    with open(filepath, "w") as f:
+        f.write(content)
+
 
 callbacks = [
     keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
@@ -315,19 +330,45 @@ if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
         callbacks=callbacks
     )
 
-#eval
-loss, acc = model.evaluate(val_ds)
-print(f"Validation Accuracy: {acc:.4f}")
+# Evaluation
+label_map = {
+    "1": "Cargo",
+    "2": "Military",
+    "3": "Carrier",
+    "4": "Cruise",
+    "5": "Tanker"
+}
+class_names = [label_map[name] for name in class_names]
+loss, acc = model.evaluate(val_ds, verbose=0)
 
 y_true, y_pred = get_labels(model, val_ds)
 
 macro_f1 = f1_score(y_true, y_pred, average="macro")
-print(f"Macro F1-score: {macro_f1:.4f}")
 
-print("\nClassification Report:")
-print(classification_report(y_true, y_pred, target_names=class_names))
+report = classification_report(
+    y_true,
+    y_pred,
+    target_names=class_names,
+    zero_division=0
+)
 
-plot_confusion_matrix(y_true, y_pred, class_names)
+# Building output string - constructed by ChatGPT
+output = []
+output.append("=== Evaluation Results ===\n")
+output.append(f"Model Type: {MODEL_TYPE}\n")
+output.append(f"Epochs: {EPOCHS}\n")
+output.append(f"Initial Learning Rate: {INITIAL_LR}\n")
+output.append(f"Validation Accuracy: {acc:.4f}\n")
+output.append(f"Macro F1-score: {macro_f1:.4f}\n\n")
+output.append("Classification Report:\n")
+output.append(report)
+output_text = "".join(output)
+
+print(output_text)
+results_filename = f"results_{MODEL_TYPE}.txt"
+save_results_to_file(results_filename, output_text)
+matrix_filename = f"confusion_matrix_{MODEL_TYPE}.png"
+plot_confusion_matrix(matrix_filename, y_true, y_pred, class_names)
 
 #test predictions
 def predict_batch(model, dataset):
