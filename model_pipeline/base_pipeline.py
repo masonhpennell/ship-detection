@@ -7,8 +7,6 @@ import numpy as np
 import os
 from sklearn.metrics import confusion_matrix, classification_report, f1_score
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, classification_report, f1_score
-import seaborn as sns
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -21,8 +19,9 @@ IMAGE_DIR = os.path.join(BASE_DIR, "images")  # folder containing all images
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
-EPOCHS = 12
-MODEL_TYPE = "transfer"  # "cnn", "vit", or "transfer"
+EPOCHS = 35
+MODEL_TYPE = "cnn"  # "cnn", "vit", or "transfer"
+MODEL_NAME = "cnn" # For output file naming
 INITIAL_LR = 1e-4
 FINE_TUNE_LR = 1e-5
 
@@ -146,24 +145,6 @@ def build_cnn_model(num_classes):
     outputs = layers.Dense(num_classes, activation="softmax")(x)
 
     return keras.Model(inputs=base_model.input, outputs=outputs)
-
-#Custom CNN (no pretrained models)
-def build_custom_cnn_model(num_classes):
-    inputs = layers.Input(shape=IMG_SIZE + (3,))
-
-    x = inputs
-    for filters in [32, 64, 128, 256]:
-        x = layers.Conv2D(filters, (3, 3), padding="same", use_bias=False)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.ReLU()(x)
-        x = layers.MaxPooling2D((2, 2))(x)
-
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(256, activation="relu")(x)
-    x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(num_classes, activation="softmax")(x)
-
-    return keras.Model(inputs=inputs, outputs=outputs)
 
 #ViT
 class Patches(layers.Layer):
@@ -305,6 +286,155 @@ def save_results_to_file(filepath, content):
     with open(filepath, "w") as f:
         f.write(content)
 
+def preprocess_single_image(image, model_type):
+    image = tf.cast(image, tf.float32)
+
+    # This block allows changes in case different architectures does different preprocessing
+    if model_type == "vit":
+        return normalization_layer(image)
+    if model_type == "cnn":
+        return image
+    if model_type == "transfer":
+        return image
+
+    return image
+
+# Integrated Gradients' functions; implementation assisted by ChatGPT
+def integrated_gradients(model, image, target_class_idx, baseline=None, steps=50):
+    image = tf.cast(image, tf.float32)
+
+    if baseline is None:
+        baseline = tf.zeros_like(image)
+    else:
+        baseline = tf.cast(baseline, tf.float32)
+
+    alphas = tf.linspace(0.0, 1.0, steps + 1)
+
+    interpolated = []
+    for alpha in alphas:
+        interpolated.append(baseline + alpha * (image - baseline))
+    interpolated = tf.stack(interpolated, axis=0)
+
+    with tf.GradientTape() as tape:
+        tape.watch(interpolated)
+        preds = model(interpolated, training=False)
+        target = preds[:, target_class_idx]
+
+    grads = tape.gradient(target, interpolated)
+    avg_grads = tf.reduce_mean(grads[:-1], axis=0)
+
+    integrated_grads = (image - baseline) * avg_grads
+    return integrated_grads.numpy()
+
+def save_integrated_gradients_overlay(image, attributions, out_path, title=""):
+    img = image.astype("float32")
+    if img.max() > 1.0:
+        img = img / 255.0
+
+    heatmap = np.sum(np.abs(attributions), axis=-1)
+    heatmap = np.maximum(heatmap, 0)
+    heatmap = heatmap / (np.max(heatmap) + 1e-8)
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img)
+    plt.imshow(heatmap, cmap="jet", alpha=0.4)
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+# Records allow us to find the 3 best, 3 worst
+def collect_prediction_records(model, dataset_raw, class_names, model_type):
+    records = []
+    for image, true_label in dataset_raw:
+        processed = preprocess_single_image(image, model_type)
+        img_batch = tf.expand_dims(processed, axis=0)
+
+        preds = model.predict(img_batch, verbose=0)[0]
+        pred_idx = int(np.argmax(preds))
+        confidence = float(preds[pred_idx])
+        true_idx = int(true_label.numpy())
+
+        records.append({
+            "image": image.numpy(),
+            "processed_image": processed.numpy(),
+            "true_idx": true_idx,
+            "pred_idx": pred_idx,
+            "true_class": class_names[true_idx],
+            "pred_class": class_names[pred_idx],
+            "confidence": confidence,
+            "correct": pred_idx == true_idx
+        })
+    return records
+
+def select_extremes(records, top_k=3):
+    correct = [r for r in records if r["correct"]]
+    incorrect = [r for r in records if not r["correct"]]
+
+    correct = sorted(correct, key=lambda r: r["confidence"], reverse=True)[:top_k]
+    incorrect = sorted(incorrect, key=lambda r: r["confidence"], reverse=True)[:top_k]
+
+    return correct, incorrect
+
+def generate_integrated_gradients(model, dataset_raw, class_names, model_type):
+    os.makedirs("integrated_gradients_images", exist_ok=True)
+
+    records = collect_prediction_records(model, dataset_raw, class_names, model_type)
+    top_correct, top_incorrect = select_extremes(records, top_k=3)
+
+    for i, record in enumerate(top_correct, start=1):
+        attributions = integrated_gradients(
+            model=model,
+            image=tf.convert_to_tensor(record["processed_image"], dtype=tf.float32),
+            target_class_idx=record["pred_idx"],
+            steps=50
+        )
+
+        title = (
+            f"Correct #{i}\n"
+            f"True: {record['true_class']} | Pred: {record['pred_class']} | "
+            f"Conf: {record['confidence']:.3f}"
+        )
+
+        out_path = os.path.join(
+            "integrated_gradients_images",
+            f"{MODEL_NAME}_correct_{i}.png"
+        )
+
+        save_integrated_gradients_overlay(
+            image=record["image"],
+            attributions=attributions,
+            out_path=out_path,
+            title=title
+        )
+
+    for i, record in enumerate(top_incorrect, start=1):
+        attributions = integrated_gradients(
+            model=model,
+            image=tf.convert_to_tensor(record["processed_image"], dtype=tf.float32),
+            target_class_idx=record["pred_idx"],
+            steps=50
+        )
+
+        title = (
+            f"Incorrect #{i}\n"
+            f"True: {record['true_class']} | Pred: {record['pred_class']} | "
+            f"Conf: {record['confidence']:.3f}"
+        )
+
+        out_path = os.path.join(
+            "integrated_gradients_images",
+            f"{MODEL_NAME}_incorrect_{i}.png"
+        )
+
+        save_integrated_gradients_overlay(
+            image=record["image"],
+            attributions=attributions,
+            out_path=out_path,
+            title=title
+        )
+
 
 callbacks = [
     keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
@@ -312,10 +442,12 @@ callbacks = [
     keras.callbacks.ModelCheckpoint("best_model.keras", save_best_only=True)
 ]
 
-train_ds, val_ds, class_names = load_datasets_from_csv(TRAIN_CSV, IMAGE_DIR, IMG_SIZE, BATCH_SIZE)
-
-train_ds = prepare(train_ds, training=True)
-val_ds   = prepare(val_ds, training=False)
+# Use val_ds_raw to get 1 image at a time; necessary for Integrated Gradients
+train_ds_raw, val_ds_raw, class_names = load_datasets_from_csv(
+    TRAIN_CSV, IMAGE_DIR, IMG_SIZE, BATCH_SIZE
+)
+train_ds = prepare(train_ds_raw, training=True)
+val_ds   = prepare(val_ds_raw, training=False)
 
 num_classes = len(class_names)
 
@@ -332,6 +464,7 @@ history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=EPOCHS,
+    callbacks=callbacks
 )
 
 if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
@@ -374,7 +507,7 @@ report = classification_report(
 # Building output string - constructed by ChatGPT
 output = []
 output.append("=== Evaluation Results ===\n")
-output.append(f"Model Type: {MODEL_TYPE}\n")
+output.append(f"Model Type: {MODEL_NAME}\n")
 output.append(f"Epochs: {EPOCHS}\n")
 output.append(f"Initial Learning Rate: {INITIAL_LR}\n")
 output.append(f"Validation Accuracy: {acc:.4f}\n")
@@ -384,10 +517,17 @@ output.append(report)
 output_text = "".join(output)
 
 print(output_text)
-results_filename = f"results_{MODEL_TYPE}.txt"
+results_filename = f"results_{MODEL_NAME}.txt"
 save_results_to_file(results_filename, output_text)
-matrix_filename = f"confusion_matrix_{MODEL_TYPE}.png"
+matrix_filename = f"confusion_matrix_{MODEL_NAME}.png"
 plot_confusion_matrix(matrix_filename, y_true, y_pred, class_names)
+
+generate_integrated_gradients(
+    model=model,
+    dataset_raw=val_ds_raw,
+    class_names=class_names,
+    model_type=MODEL_TYPE
+)
 
 #test predictions
 def predict_batch(model, dataset):
