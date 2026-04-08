@@ -30,3 +30,9 @@ Set these constants in `base_pipeline.py`:
 - `EPOCHS`: initial feature-extractor training epochs (frozen backbone)
 - `FINE_TUNE_EPOCHS`: additional epochs after unfreezing part of backbone
 - `UNFREEZE_AT`: layer index where fine-tuning begins
+
+
+Assignment 2 Contributions:
+- Jack: Identification and backbone of segmentation task
+- Mason: Convolution, Transformer and Transfer Learning implementation
+- Spencer: Evaluation, outputs, and write-up

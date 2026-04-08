@@ -193,7 +193,6 @@ def build_vit_model(num_classes):
         attention = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=projection_dim)(x1, x1)
         x2 = layers.Add()([attention, encoded])
-
         x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
         x3 = layers.Dense(projection_dim * 2, activation="gelu")(x3)
         x3 = layers.Dense(projection_dim)(x3)
