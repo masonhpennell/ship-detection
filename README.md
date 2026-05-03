@@ -1,6 +1,8 @@
 # Ship Detection with Computer Vision
 Created by Mason Pennell, Spencer Lafferty, and Jack de Bruyn
 
+Github: https://github.com/masonhpennell/ship-detection
+
 Dataset: [Classification of Ship Images](https://www.kaggle.com/code/teeyee314/classification-of-ship-images/input)
 
 ## Why are we doing this?
