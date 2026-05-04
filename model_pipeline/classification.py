@@ -1,0 +1,543 @@
+from pandas import read_csv
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import tensorflow.keras as keras
+from tensorflow.keras import layers
+import numpy as np
+import os
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
+import seaborn as sns
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Dataset locations (relative to this file)
+TRAIN_CSV = os.path.join(BASE_DIR, "train.csv")
+TEST_CSV = os.path.join(BASE_DIR, "test.csv")
+IMAGE_DIR = os.path.join(BASE_DIR, "dataset/images")  # folder containing all images
+
+#config
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+AUTOTUNE = tf.data.AUTOTUNE
+EPOCHS = 35
+MODEL_TYPE = "cnn"  # "cnn", "vit", or "transfer"
+MODEL_NAME = "cnn" # For output file naming
+INITIAL_LR = 1e-4
+FINE_TUNE_LR = 1e-5
+
+# transfer learning config
+TRANSFER_WEIGHTS = "imagenet"
+TRANSFER_DROPOUT = 0.2
+FINE_TUNE_EPOCHS = 10
+UNFREEZE_AT = 100
+
+#preprocessing
+def decode_and_resize(image_path, img_size=IMG_SIZE):
+    image_bytes = tf.io.read_file(image_path)
+    image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+    image.set_shape([None, None, 3])
+    image = tf.image.resize(image, img_size)
+    image = tf.cast(image, tf.float32)
+    image.set_shape(img_size + (3,))
+    return image
+
+def load_image_with_label(image_path, label):
+    image = decode_and_resize(image_path)
+    return image, label
+
+def load_image_only(image_path):
+    image = decode_and_resize(image_path)
+    return image
+
+def make_paths_from_csv(df, image_root, image_col):
+    # If the CSV already stores full paths, this still works because os.path.join
+    # will keep the absolute path if image_col is absolute.
+    return df[image_col].apply(lambda x: os.path.join(image_root, str(x))).tolist()
+
+def load_datasets_from_csv(
+    train_csv,
+    image_root,
+    img_size,
+    batch_size,
+    image_col="image",
+    label_col="category",
+    val_split=0.2,
+    seed=42
+):
+    df = read_csv(train_csv)
+
+    # Shuffle before splitting
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    # Build label vocabulary from training CSV
+    class_names = sorted(df[label_col].astype(str).unique().tolist())
+    label_lookup = layers.StringLookup(vocabulary=class_names, num_oov_indices=0)
+
+    # Train/validation split
+    val_size = int(len(df) * val_split)
+    val_df = df.iloc[:val_size].copy()
+    train_df = df.iloc[val_size:].copy()
+
+    train_paths = make_paths_from_csv(train_df, image_root, image_col)
+    val_paths   = make_paths_from_csv(val_df, image_root, image_col)
+
+    train_labels = train_df[label_col].astype(str).tolist()
+    val_labels   = val_df[label_col].astype(str).tolist()
+
+    train_labels = label_lookup(tf.constant(train_labels))
+    val_labels   = label_lookup(tf.constant(val_labels))
+
+    train_ds = tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
+    val_ds   = tf.data.Dataset.from_tensor_slices((val_paths, val_labels))
+
+    train_ds = train_ds.map(load_image_with_label, num_parallel_calls=AUTOTUNE)
+    val_ds   = val_ds.map(load_image_with_label, num_parallel_calls=AUTOTUNE)
+
+    return train_ds, val_ds, class_names
+
+def load_test_dataset(test_csv, image_root, image_col="image"):
+    df = read_csv(test_csv)
+    test_paths = make_paths_from_csv(df, image_root, image_col)
+    test_ds = tf.data.Dataset.from_tensor_slices(test_paths)
+    test_ds = test_ds.map(load_image_only, num_parallel_calls=AUTOTUNE)
+    return test_ds, df
+
+#normalization
+normalization_layer = layers.Rescaling(1./255)
+
+#data augmentation
+data_augmentation = keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+    layers.RandomZoom(0.1),
+    layers.RandomContrast(0.1),
+])
+
+def prepare(ds, training=False):
+    if MODEL_TYPE == "vit":
+        ds = ds.map(lambda x, y: (normalization_layer(x), y),
+                    num_parallel_calls=AUTOTUNE)
+
+    if training and MODEL_TYPE != "transfer":
+        ds = ds.map(lambda x, y: (data_augmentation(x), y),
+                    num_parallel_calls=AUTOTUNE)
+
+    ds = ds.batch(BATCH_SIZE)
+    return ds.prefetch(AUTOTUNE)
+
+#model architectures, both CNN and Vit
+#CNN
+def build_cnn_model(num_classes):
+    base_model = tf.keras.applications.EfficientNetB0(
+        include_top=False,
+        weights=None,
+        input_shape=IMG_SIZE + (3,)
+    )
+
+    base_model.trainable = True  # fine-tune later if needed
+
+    x = base_model.output
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    return keras.Model(inputs=base_model.input, outputs=outputs)
+
+#ViT
+class Patches(layers.Layer):
+    def __init__(self, patch_size=16):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def call(self, images):
+        batch_size = tf.shape(images)[0]
+        patches = tf.image.extract_patches(
+            images=images,
+            sizes=[1, self.patch_size, self.patch_size, 1],
+            strides=[1, self.patch_size, self.patch_size, 1],
+            rates=[1, 1, 1, 1],
+            padding='VALID'
+        )
+        patch_dims = patches.shape[-1]
+        patches = tf.reshape(patches, [batch_size, -1, patch_dims])
+        return patches
+    
+class PatchEncoder(layers.Layer):
+    def __init__(self, num_patches, projection_dim):
+        super().__init__()
+        self.projection = layers.Dense(projection_dim)
+        self.position_embedding = layers.Embedding(
+            input_dim=num_patches, output_dim=projection_dim
+        )
+
+    def call(self, patches):
+        positions = tf.range(start=0, limit=tf.shape(patches)[1], delta=1)
+        return self.projection(patches) + self.position_embedding(positions)
+    
+def build_vit_model(num_classes):
+    patch_size = 16
+    num_patches = (IMG_SIZE[0] // patch_size) ** 2
+    projection_dim = 64
+    num_heads = 4
+    transformer_layers = 6
+
+    inputs = layers.Input(shape=IMG_SIZE + (3,))
+    patches = Patches(patch_size)(inputs)
+    encoded = PatchEncoder(num_patches, projection_dim)(patches)
+
+    for _ in range(transformer_layers):
+        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded)
+        attention = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim)(x1, x1)
+        x2 = layers.Add()([attention, encoded])
+        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+        x3 = layers.Dense(projection_dim * 2, activation="gelu")(x3)
+        x3 = layers.Dense(projection_dim)(x3)
+
+        encoded = layers.Add()([x3, x2])
+
+    x = layers.LayerNormalization(epsilon=1e-6)(encoded)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    return keras.Model(inputs=inputs, outputs=outputs)
+
+# Transfer
+def build_transfer_model(
+    num_classes,
+    weights=TRANSFER_WEIGHTS,
+    dropout=TRANSFER_DROPOUT
+):
+    backbone_cls = tf.keras.applications.MobileNetV2
+    preprocess_input = tf.keras.applications.mobilenet_v2.preprocess_input
+
+    base_model = backbone_cls(
+        input_shape=IMG_SIZE + (3,),
+        include_top=False,
+        weights=weights
+    )
+    base_model.trainable = False
+
+    inputs = keras.Input(shape=IMG_SIZE + (3,))
+    x = data_augmentation(inputs)
+    x = preprocess_input(x)
+    x = base_model(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(dropout)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    model = keras.Model(inputs, outputs)
+    return model, base_model
+
+#training
+def compile_model(model, learning_rate=INITIAL_LR):
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+# Evaluation functions
+def get_labels(model, dataset):
+    y_true = []
+    y_pred = []
+
+    for batch_images, batch_labels in dataset:
+        preds = model.predict(batch_images, verbose=0)
+        pred_labels = np.argmax(preds, axis=1)
+
+        y_true.extend(batch_labels.numpy())
+        y_pred.extend(pred_labels)
+
+    return np.array(y_true), np.array(y_pred)
+
+def plot_confusion_matrix(filename, y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=class_names,
+        yticklabels=class_names
+    )
+
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.title("Confusion Matrix")
+
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.tight_layout()
+    plt.show()
+
+# Writing to file processes from ChatGPT
+def save_results_to_file(filepath, content):
+    with open(filepath, "w") as f:
+        f.write(content)
+
+def preprocess_single_image(image, model_type):
+    image = tf.cast(image, tf.float32)
+
+    # This block allows changes in case different architectures does different preprocessing
+    if model_type == "vit":
+        return normalization_layer(image)
+    if model_type == "cnn":
+        return image
+    if model_type == "transfer":
+        return image
+
+    return image
+
+# Integrated Gradients' functions; implementation assisted by ChatGPT
+def integrated_gradients(model, image, target_class_idx, baseline=None, steps=50):
+    image = tf.cast(image, tf.float32)
+
+    if baseline is None:
+        baseline = tf.zeros_like(image)
+    else:
+        baseline = tf.cast(baseline, tf.float32)
+
+    alphas = tf.linspace(0.0, 1.0, steps + 1)
+
+    interpolated = []
+    for alpha in alphas:
+        interpolated.append(baseline + alpha * (image - baseline))
+    interpolated = tf.stack(interpolated, axis=0)
+
+    with tf.GradientTape() as tape:
+        tape.watch(interpolated)
+        preds = model(interpolated, training=False)
+        target = preds[:, target_class_idx]
+
+    grads = tape.gradient(target, interpolated)
+    avg_grads = tf.reduce_mean(grads[:-1], axis=0)
+
+    integrated_grads = (image - baseline) * avg_grads
+    return integrated_grads.numpy()
+
+def save_integrated_gradients_overlay(image, attributions, out_path, title=""):
+    img = image.astype("float32")
+    if img.max() > 1.0:
+        img = img / 255.0
+
+    heatmap = np.sum(np.abs(attributions), axis=-1)
+    heatmap = np.maximum(heatmap, 0)
+    heatmap = heatmap / (np.max(heatmap) + 1e-8)
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img)
+    plt.imshow(heatmap, cmap="jet", alpha=0.4)
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+# Records allow us to find the 3 best, 3 worst
+def collect_prediction_records(model, dataset_raw, class_names, model_type):
+    records = []
+    for image, true_label in dataset_raw:
+        processed = preprocess_single_image(image, model_type)
+        img_batch = tf.expand_dims(processed, axis=0)
+
+        preds = model.predict(img_batch, verbose=0)[0]
+        pred_idx = int(np.argmax(preds))
+        confidence = float(preds[pred_idx])
+        true_idx = int(true_label.numpy())
+
+        records.append({
+            "image": image.numpy(),
+            "processed_image": processed.numpy(),
+            "true_idx": true_idx,
+            "pred_idx": pred_idx,
+            "true_class": class_names[true_idx],
+            "pred_class": class_names[pred_idx],
+            "confidence": confidence,
+            "correct": pred_idx == true_idx
+        })
+    return records
+
+def select_extremes(records, top_k=3):
+    correct = [r for r in records if r["correct"]]
+    incorrect = [r for r in records if not r["correct"]]
+
+    correct = sorted(correct, key=lambda r: r["confidence"], reverse=True)[:top_k]
+    incorrect = sorted(incorrect, key=lambda r: r["confidence"], reverse=True)[:top_k]
+
+    return correct, incorrect
+
+def generate_integrated_gradients(model, dataset_raw, class_names, model_type):
+    os.makedirs("integrated_gradients_images", exist_ok=True)
+
+    records = collect_prediction_records(model, dataset_raw, class_names, model_type)
+    top_correct, top_incorrect = select_extremes(records, top_k=3)
+
+    for i, record in enumerate(top_correct, start=1):
+        attributions = integrated_gradients(
+            model=model,
+            image=tf.convert_to_tensor(record["processed_image"], dtype=tf.float32),
+            target_class_idx=record["pred_idx"],
+            steps=50
+        )
+
+        title = (
+            f"Correct #{i}\n"
+            f"True: {record['true_class']} | Pred: {record['pred_class']} | "
+            f"Conf: {record['confidence']:.3f}"
+        )
+
+        out_path = os.path.join(
+            "integrated_gradients_images",
+            f"{MODEL_NAME}_correct_{i}.png"
+        )
+
+        save_integrated_gradients_overlay(
+            image=record["image"],
+            attributions=attributions,
+            out_path=out_path,
+            title=title
+        )
+
+    for i, record in enumerate(top_incorrect, start=1):
+        attributions = integrated_gradients(
+            model=model,
+            image=tf.convert_to_tensor(record["processed_image"], dtype=tf.float32),
+            target_class_idx=record["pred_idx"],
+            steps=50
+        )
+
+        title = (
+            f"Incorrect #{i}\n"
+            f"True: {record['true_class']} | Pred: {record['pred_class']} | "
+            f"Conf: {record['confidence']:.3f}"
+        )
+
+        out_path = os.path.join(
+            "integrated_gradients_images",
+            f"{MODEL_NAME}_incorrect_{i}.png"
+        )
+
+        save_integrated_gradients_overlay(
+            image=record["image"],
+            attributions=attributions,
+            out_path=out_path,
+            title=title
+        )
+
+
+callbacks = [
+    keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+    keras.callbacks.ReduceLROnPlateau(patience=3),
+    keras.callbacks.ModelCheckpoint("best_model.keras", save_best_only=True)
+]
+
+# Use val_ds_raw to get 1 image at a time; necessary for Integrated Gradients
+train_ds_raw, val_ds_raw, class_names = load_datasets_from_csv(
+    TRAIN_CSV, IMAGE_DIR, IMG_SIZE, BATCH_SIZE
+)
+train_ds = prepare(train_ds_raw, training=True)
+val_ds   = prepare(val_ds_raw, training=False)
+
+num_classes = len(class_names)
+
+if   MODEL_TYPE == "cnn": model = build_cnn_model(num_classes)
+elif MODEL_TYPE == "vit": model = build_vit_model(num_classes)
+elif MODEL_TYPE == "transfer":
+    model, base_model = build_transfer_model(num_classes)
+else:
+    raise ValueError("MODEL_TYPE must be one of: cnn, vit, transfer")
+
+model = compile_model(model)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=callbacks
+)
+
+if MODEL_TYPE == "transfer" and FINE_TUNE_EPOCHS > 0:
+    base_model.trainable = True
+    for layer in base_model.layers[:UNFREEZE_AT]:
+        layer.trainable = False
+
+    model = compile_model(model, learning_rate=FINE_TUNE_LR)
+
+    history_fine = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS + FINE_TUNE_EPOCHS,
+        initial_epoch=history.epoch[-1] + 1,
+        callbacks=callbacks
+    )
+
+# Evaluation
+label_map = {
+    "1": "Cargo",
+    "2": "Military",
+    "3": "Carrier",
+    "4": "Cruise",
+    "5": "Tanker"
+}
+class_names = [label_map[name] for name in class_names]
+loss, acc = model.evaluate(val_ds, verbose=0)
+
+y_true, y_pred = get_labels(model, val_ds)
+
+macro_f1 = f1_score(y_true, y_pred, average="macro")
+
+report = classification_report(
+    y_true,
+    y_pred,
+    target_names=class_names,
+    zero_division=0
+)
+
+# Building output string - constructed by ChatGPT
+output = []
+output.append("=== Evaluation Results ===\n")
+output.append(f"Model Type: {MODEL_NAME}\n")
+output.append(f"Epochs: {EPOCHS}\n")
+output.append(f"Initial Learning Rate: {INITIAL_LR}\n")
+output.append(f"Validation Accuracy: {acc:.4f}\n")
+output.append(f"Macro F1-score: {macro_f1:.4f}\n\n")
+output.append("Classification Report:\n")
+output.append(report)
+output_text = "".join(output)
+
+print(output_text)
+results_filename = f"results_{MODEL_NAME}.txt"
+save_results_to_file(results_filename, output_text)
+matrix_filename = f"confusion_matrix_{MODEL_NAME}.png"
+plot_confusion_matrix(matrix_filename, y_true, y_pred, class_names)
+
+generate_integrated_gradients(
+    model=model,
+    dataset_raw=val_ds_raw,
+    class_names=class_names,
+    model_type=MODEL_TYPE
+)
+
+#test predictions
+def predict_batch(model, dataset):
+    preds = model.predict(dataset)
+    return tf.argmax(preds, axis=1)
+
+def predict_image(model, img_path, class_names):
+    img = tf.keras.utils.load_img(img_path, target_size=IMG_SIZE)
+    img = tf.keras.utils.img_to_array(img)
+    img = normalization_layer(img)
+    img = tf.expand_dims(img, axis=0)
+
+    preds = model.predict(img)
+    return class_names[np.argmax(preds)]
