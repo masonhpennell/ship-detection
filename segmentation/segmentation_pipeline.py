@@ -1,126 +1,333 @@
 import os
+import glob
+import random
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
 import tensorflow as tf
+import math
 from tensorflow import keras
 from tensorflow.keras import layers
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATASET_DIR = os.path.join(BASE_DIR, 'dataset')
-TRAIN_CSV = os.path.join(DATASET_DIR, 'train.csv')
-TEST_CSV = os.path.join(DATASET_DIR, 'test.csv')
-IMAGE_DIR = os.path.join(DATASET_DIR, 'images')
-MASK_DIR = os.path.join(DATASET_DIR, 'masks')
+# =========================================================
+# CONFIGURATION
+# =========================================================
+class Config:
+    IMAGE_SIZE = (256, 256)
+    BATCH_SIZE = 8
+    EPOCHS = 25
+    DATASET_PATH = "dataset"
+    IMAGE_DIR = os.path.join(DATASET_PATH, "images")
+    MASK_DIR = os.path.join(DATASET_PATH, "masks")
+    VAL_SPLIT = 0.2
+    AUTOTUNE = tf.data.AUTOTUNE
+    NUM_CLASSES = 1  # Binary segmentation
+    LEARNING_RATE = 1e-4
+    SEED = 42
+    MODEL_PATH = "unet_model.h5"
 
-IMG_SIZE=(224,224)
-BATCH_SIZE=8
-EPOCHS=40
-NUM_CLASSES=6
-MODEL_TYPE='unet' # unet, deeplab, fcn
-INITIAL_LR=1e-4
-AUTOTUNE=tf.data.AUTOTUNE
 
-# ---- Segmentation data loaders (replaces classification labels) ----
-def read_image(path):
-    x=tf.io.read_file(path)
-    x=tf.image.decode_image(x, channels=3, expand_animations=False)
-    x=tf.image.resize(x, IMG_SIZE)
-    x=tf.cast(x, tf.float32)/255.0
-    x.set_shape(IMG_SIZE+(3,))
-    return x
+# =========================================================
+# DATA LOADING
+# =========================================================
+def get_image_mask_pairs(image_dir, mask_dir):
+    image_exts = (".jpg", ".jpeg", ".png")
+    mask_exts = (".png", ".jpg", ".jpeg")
 
-def read_mask(path):
-    x=tf.io.read_file(path)
-    x=tf.image.decode_image(x, channels=1, expand_animations=False)
-    x=tf.image.resize(x, IMG_SIZE, method='nearest')
-    x=tf.cast(x, tf.int32)
-    x=tf.squeeze(x, axis=-1)
-    x.set_shape(IMG_SIZE)
-    return x
+    image_paths = sorted([
+        p for p in glob.glob(os.path.join(image_dir, "*"))
+        if p.lower().endswith(image_exts)
+    ])
 
-def load_pair(img_path, mask_path):
-    return read_image(img_path), read_mask(mask_path)
+    # Build mask lookup by basename
+    mask_files = glob.glob(os.path.join(mask_dir, "*"))
+    mask_dict = {}
 
-def make_paths(df):
-    imgs=[os.path.join(IMAGE_DIR, f) for f in df['image'].astype(str)]
-    masks=[os.path.join(MASK_DIR, os.path.splitext(f)[0]+'.png') for f in df['image'].astype(str)]
-    return imgs,masks
+    for m in mask_files:
+        base = os.path.splitext(os.path.basename(m))[0]
+        mask_dict[base] = m
 
-def build_ds(csv_path, val_split=0.2):
-    df=pd.read_csv(csv_path).sample(frac=1, random_state=42).reset_index(drop=True)
-    n=int(len(df)*val_split)
-    val_df, train_df=df.iloc[:n], df.iloc[n:]
-    tr_i,tr_m=make_paths(train_df); va_i,va_m=make_paths(val_df)
-    train=tf.data.Dataset.from_tensor_slices((tr_i,tr_m)).map(load_pair,num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
-    val=tf.data.Dataset.from_tensor_slices((va_i,va_m)).map(load_pair,num_parallel_calls=AUTOTUNE).batch(BATCH_SIZE).prefetch(AUTOTUNE)
-    return train,val
+    pairs = []
 
-# ---- Models ----
-def conv_block(x,f):
-    x=layers.Conv2D(f,3,padding='same',activation='relu')(x)
-    x=layers.Conv2D(f,3,padding='same',activation='relu')(x)
-    return x
+    for img_path in image_paths:
+        base = os.path.splitext(os.path.basename(img_path))[0]
 
-def build_unet():
-    base=tf.keras.applications.EfficientNetB0(include_top=False,weights='imagenet',input_shape=IMG_SIZE+(3,))
-    skips=[base.get_layer(n).output for n in ['block2a_expand_activation','block3a_expand_activation','block4a_expand_activation','block6a_expand_activation']]
-    x=base.output
-    for s,f in zip(reversed(skips),[256,128,64,32]):
-        x=layers.UpSampling2D()(x)
-        x=layers.Concatenate()([x,s])
-        x=conv_block(x,f)
-    x=layers.UpSampling2D()(x)
-    x=conv_block(x,32)
-    out=layers.Conv2D(NUM_CLASSES,1,activation='softmax')(x)
-    return keras.Model(base.input,out)
+        if base not in mask_dict:
+            print(f"WARNING: No mask found for {base}")
+            continue
 
-def build_fcn():
-    inp=keras.Input(shape=IMG_SIZE+(3,))
-    x=conv_block(inp,32); x=layers.MaxPool2D()(x)
-    x=conv_block(x,64)
-    x=layers.UpSampling2D(size=2)(x)
-    out=layers.Conv2D(NUM_CLASSES,1,activation='softmax')(x)
-    return keras.Model(inp,out)
+        pairs.append((img_path, mask_dict[base]))
 
-def build_deeplab():
-    return build_unet()
+    if len(pairs) == 0:
+        raise ValueError("No valid image-mask pairs found.")
 
-# ---- Metrics/Losses ----
-def dice_coef(y_true,y_pred):
-    y_true=tf.one_hot(tf.cast(y_true,tf.int32),NUM_CLASSES)
-    y_true=tf.reshape(y_true,[-1,NUM_CLASSES])
-    y_pred=tf.reshape(y_pred,[-1,NUM_CLASSES])
-    inter=tf.reduce_sum(y_true*y_pred)
-    den=tf.reduce_sum(y_true)+tf.reduce_sum(y_pred)
-    return (2*inter+1)/(den+1)
+    print(f"✅ Found {len(pairs)} valid image-mask pairs")
 
-def pixel_acc(y_true,y_pred):
-    pred=tf.argmax(y_pred,axis=-1,output_type=tf.int32)
-    return tf.reduce_mean(tf.cast(tf.equal(y_true,pred),tf.float32))
+    images, masks = zip(*pairs)
+    return list(images), list(masks)
 
-miou=tf.keras.metrics.MeanIoU(num_classes=NUM_CLASSES,sparse_y_true=True,sparse_y_pred=False)
 
-# ---- Train ----
-train_ds,val_ds=build_ds(TRAIN_CSV)
-model = build_unet() if MODEL_TYPE=='unet' else build_fcn() if MODEL_TYPE=='fcn' else build_deeplab()
-model.compile(optimizer=keras.optimizers.Adam(INITIAL_LR), loss='sparse_categorical_crossentropy', metrics=[pixel_acc,dice_coef,miou])
-callbacks=[keras.callbacks.EarlyStopping(patience=6,restore_best_weights=True), keras.callbacks.ReduceLROnPlateau(patience=3), keras.callbacks.ModelCheckpoint('best_segmentation.keras',save_best_only=True)]
-model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=callbacks)
+def train_val_split(image_paths, mask_paths, val_split):
+    combined = list(zip(image_paths, mask_paths))
+    random.shuffle(combined)
 
-# ---- Evaluation + visualization (replaces confusion matrix / IG) ----
-loss,pa,dice,mi = model.evaluate(val_ds)
-print({'loss':loss,'pixel_acc':pa,'dice':dice,'miou':mi})
+    split_idx = int(len(combined) * (1 - val_split))
+    train = combined[:split_idx]
+    val = combined[split_idx:]
 
-os.makedirs('predictions',exist_ok=True)
-for imgs,masks in val_ds.take(1):
-    preds=model.predict(imgs)
-    pm=tf.argmax(preds,axis=-1)
-    for i in range(min(3,imgs.shape[0])):
-        fig,ax=plt.subplots(1,4,figsize=(14,4))
-        ax[0].imshow(imgs[i]); ax[0].set_title('image')
-        ax[1].imshow(masks[i]); ax[1].set_title('gt')
-        ax[2].imshow(pm[i]); ax[2].set_title('pred')
-        ax[3].imshow(imgs[i]); ax[3].imshow(pm[i],alpha=0.4); ax[3].set_title('overlay')
-        [a.axis('off') for a in ax]
-        plt.tight_layout(); plt.savefig(f'predictions/sample_{i}.png'); plt.close()
+    train_images, train_masks = zip(*train)
+    val_images, val_masks = zip(*val)
+
+    return list(train_images), list(train_masks), list(val_images), list(val_masks)
+
+
+# =========================================================
+# PREPROCESSING
+# =========================================================
+def parse_image(img_path, mask_path):
+    # --- IMAGE ---
+    img_bytes = tf.io.read_file(img_path)
+    img = tf.image.decode_jpeg(img_bytes, channels=3)  # ✅ FIXED
+    img.set_shape([None, None, 3])  # explicitly set shape
+
+    img = tf.image.resize(img, Config.IMAGE_SIZE)
+    img = tf.cast(img, tf.float32) / 255.0
+
+    # --- MASK ---
+    mask_bytes = tf.io.read_file(mask_path)
+    mask = tf.image.decode_png(mask_bytes, channels=1)  # ✅ FIXED
+    mask.set_shape([None, None, 1])
+
+    mask = tf.image.resize(mask, Config.IMAGE_SIZE, method="nearest")
+    mask = tf.cast(mask > 0, tf.float32)
+
+    return img, mask
+
+
+# =========================================================
+# AUGMENTATION
+# =========================================================
+def augment(img, mask):
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.flip_left_right(img)
+        mask = tf.image.flip_left_right(mask)
+
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.flip_up_down(img)
+        mask = tf.image.flip_up_down(mask)
+
+    if tf.random.uniform(()) > 0.5:
+        k = tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32)
+        img = tf.image.rot90(img, k)
+        mask = tf.image.rot90(mask, k)
+
+    return img, mask
+
+
+# =========================================================
+# TF.DATA PIPELINE
+# =========================================================
+def build_dataset(image_paths, mask_paths, training=True):
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
+
+    dataset = dataset.map(
+        lambda x, y: parse_image(x, y),
+        num_parallel_calls=Config.AUTOTUNE
+    )
+
+    if training:
+        dataset = dataset.map(augment, num_parallel_calls=Config.AUTOTUNE)
+        dataset = dataset.cache()
+        dataset = dataset.shuffle(100)
+        dataset = dataset.repeat()   # ✅ FIX
+    else:
+        dataset = dataset.cache()
+
+    dataset = dataset.batch(Config.BATCH_SIZE)
+    dataset = dataset.prefetch(Config.AUTOTUNE)
+
+    return dataset
+
+
+# =========================================================
+# MODEL (U-NET WITH MOBILENETV2 ENCODER)
+# =========================================================
+def unet_model(input_shape=(256, 256, 3)):
+    base_model = keras.applications.MobileNetV2(
+        input_shape=input_shape,
+        include_top=False,
+        weights="imagenet"
+    )
+
+    # Encoder layers
+    layer_names = [
+        "block_1_expand_relu",   # 128x128
+        "block_3_expand_relu",   # 64x64
+        "block_6_expand_relu",   # 32x32
+        "block_13_expand_relu",  # 16x16
+        "block_16_project",      # 8x8
+    ]
+
+    layers_outputs = [base_model.get_layer(name).output for name in layer_names]
+    encoder = keras.Model(inputs=base_model.input, outputs=layers_outputs)
+
+    encoder.trainable = False  # freeze initially
+
+    inputs = keras.Input(shape=input_shape)
+    skips = encoder(inputs)
+    x = skips[-1]
+
+    # Decoder
+    decoder_filters = [512, 256, 128, 64]
+
+    for i in range(4):
+        x = layers.Conv2DTranspose(decoder_filters[i], 3, strides=2, padding="same")(x)
+        x = layers.Concatenate()([x, skips[-(i + 2)]])
+        x = layers.Conv2D(decoder_filters[i], 3, activation="relu", padding="same")(x)
+        x = layers.Conv2D(decoder_filters[i], 3, activation="relu", padding="same")(x)
+
+    # Final upsampling to match input resolution (256x256)
+    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same")(x)
+    x = layers.Conv2D(32, 3, activation="relu", padding="same")(x)
+
+    outputs = layers.Conv2D(1, 1, activation="sigmoid")(x)
+
+    return keras.Model(inputs, outputs)
+
+
+# =========================================================
+# METRICS
+# =========================================================
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    y_true = tf.reshape(y_true, [-1])
+    y_pred = tf.reshape(y_pred, [-1])
+    intersection = tf.reduce_sum(y_true * y_pred)
+    return (2. * intersection + smooth) / (
+        tf.reduce_sum(y_true) + tf.reduce_sum(y_pred) + smooth
+    )
+
+
+def iou_score(y_true, y_pred, smooth=1e-6):
+    y_pred = tf.cast(y_pred > 0.5, tf.float32)
+    intersection = tf.reduce_sum(y_true * y_pred)
+    union = tf.reduce_sum(y_true) + tf.reduce_sum(y_pred) - intersection
+    return (intersection + smooth) / (union + smooth)
+
+
+# =========================================================
+# VISUALIZATION
+# =========================================================
+def display_predictions(model, dataset, num=3):
+    for images, masks in dataset.take(1):
+        preds = model.predict(images)
+
+        for i in range(num):
+            plt.figure(figsize=(12, 4))
+
+            plt.subplot(1, 3, 1)
+            plt.title("Image")
+            plt.imshow(images[i])
+            plt.axis("off")
+
+            plt.subplot(1, 3, 2)
+            plt.title("Ground Truth")
+            plt.imshow(tf.squeeze(masks[i]), cmap="gray")
+            plt.axis("off")
+
+            plt.subplot(1, 3, 3)
+            plt.title("Prediction")
+            plt.imshow(tf.squeeze(preds[i] > 0.5), cmap="gray")
+            plt.axis("off")
+
+            plt.show()
+
+
+# =========================================================
+# INFERENCE
+# =========================================================
+def predict_single_image(model, image_path):
+    img = tf.io.read_file(image_path)
+    img = tf.image.decode_image(img, channels=3)
+    img = tf.image.resize(img, Config.IMAGE_SIZE)
+    img = tf.cast(img, tf.float32) / 255.0
+
+    input_img = tf.expand_dims(img, axis=0)
+    pred = model.predict(input_img)[0]
+
+    plt.figure(figsize=(8, 4))
+
+    plt.subplot(1, 2, 1)
+    plt.title("Input")
+    plt.imshow(img)
+    plt.axis("off")
+
+    plt.subplot(1, 2, 2)
+    plt.title("Prediction")
+    plt.imshow(tf.squeeze(pred > 0.5), cmap="gray")
+    plt.axis("off")
+
+    plt.show()
+
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+def main():
+    tf.random.set_seed(Config.SEED)
+    random.seed(Config.SEED)
+
+    print("Loading dataset...")
+    image_paths, mask_paths = get_image_mask_pairs(
+        Config.IMAGE_DIR, Config.MASK_DIR
+    )
+
+    train_imgs, train_masks, val_imgs, val_masks = train_val_split(
+        image_paths, mask_paths, Config.VAL_SPLIT
+    )
+
+    train_ds = build_dataset(train_imgs, train_masks, training=True)
+    val_ds = build_dataset(val_imgs, val_masks, training=False)
+
+    print("Building model...")
+    model = unet_model(input_shape=(*Config.IMAGE_SIZE, 3))
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(Config.LEARNING_RATE),
+        loss="binary_crossentropy",
+        metrics=[dice_coefficient, iou_score]
+    )
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            Config.MODEL_PATH, save_best_only=True, monitor="val_loss"
+        ),
+        keras.callbacks.EarlyStopping(
+            patience=5, restore_best_weights=True
+        )
+    ]
+
+    print("Training...")
+
+    validation_steps = math.ceil(len(val_imgs) / Config.BATCH_SIZE)
+    steps_per_epoch = math.ceil(len(train_imgs) / Config.BATCH_SIZE)
+
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=Config.EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
+        callbacks=callbacks
+    )
+
+    print("Evaluating...")
+    model.evaluate(val_ds)
+
+    print("Displaying predictions...")
+    display_predictions(model, val_ds)
+
+    # Example inference (replace with real path)
+    # predict_single_image(model, "dataset/images/example.jpg")
+
+
+if __name__ == "__main__":
+    main()
