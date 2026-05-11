@@ -14,7 +14,7 @@ from tensorflow.keras import layers
 class Config:
     IMAGE_SIZE = (256, 256)
     BATCH_SIZE = 8
-    EPOCHS = 10
+    EPOCHS = 5
     DATASET_PATH = "dataset"
     IMAGE_DIR = os.path.join(DATASET_PATH, "images")
     MASK_DIR = os.path.join(DATASET_PATH, "masks")
@@ -24,6 +24,8 @@ class Config:
     LEARNING_RATE = 1e-4
     SEED = 42
     MODEL_PATH = "unet_model.h5"
+    FINE_TUNED = True # set True For part D
+    TRANSFER_LEARNING = False # set False For part B
 
 
 # =========================================================
@@ -151,11 +153,11 @@ def build_dataset(image_paths, mask_paths, training=True):
 # =========================================================
 # MODEL (U-NET WITH MOBILENETV2 ENCODER)
 # =========================================================
-def unet_model(input_shape=(256, 256, 3)):
+def unet_model(weights, trainable, input_shape=(256, 256, 3)):
     base_model = keras.applications.MobileNetV2(
         input_shape=input_shape,
         include_top=False,
-        weights="imagenet"
+        weights="imagenet" if weights else None
     )
 
     # Encoder layers
@@ -170,7 +172,7 @@ def unet_model(input_shape=(256, 256, 3)):
     layers_outputs = [base_model.get_layer(name).output for name in layer_names]
     encoder = keras.Model(inputs=base_model.input, outputs=layers_outputs)
 
-    encoder.trainable = False  # freeze initially
+    encoder.trainable = trainable  # freeze initially
 
     inputs = keras.Input(shape=input_shape)
     skips = encoder(inputs)
@@ -288,7 +290,11 @@ def main():
     val_ds = build_dataset(val_imgs, val_masks, training=False)
 
     print("Building model...")
-    model = unet_model(input_shape=(*Config.IMAGE_SIZE, 3))
+    model = unet_model(
+        weights=Config.TRANSFER_LEARNING,
+        trainable=Config.FINE_TUNED,
+        input_shape=(*Config.IMAGE_SIZE, 3)
+    )
 
     model.compile(
         optimizer=keras.optimizers.Adam(Config.LEARNING_RATE),
