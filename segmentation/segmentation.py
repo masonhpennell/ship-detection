@@ -99,7 +99,7 @@ def train_val_split(image_paths, mask_paths, val_split):
 def parse_image(img_path, mask_path):
     # --- IMAGE ---
     img_bytes = tf.io.read_file(img_path)
-    img = tf.image.decode_jpeg(img_bytes, channels=3)  # ✅ FIXED
+    img = tf.image.decode_jpeg(img_bytes, channels=3)  
     img.set_shape([None, None, 3])  # explicitly set shape
 
     img = tf.image.resize(img, Config.IMAGE_SIZE)
@@ -107,7 +107,7 @@ def parse_image(img_path, mask_path):
 
     # --- MASK ---
     mask_bytes = tf.io.read_file(mask_path)
-    mask = tf.image.decode_png(mask_bytes, channels=1)  # ✅ FIXED
+    mask = tf.image.decode_png(mask_bytes, channels=1)  
     mask.set_shape([None, None, 1])
 
     mask = tf.image.resize(mask, Config.IMAGE_SIZE, method="nearest")
@@ -151,7 +151,7 @@ def build_dataset(image_paths, mask_paths, training=True):
         dataset = dataset.map(augment, num_parallel_calls=Config.AUTOTUNE)
         dataset = dataset.cache()
         dataset = dataset.shuffle(100)
-        dataset = dataset.repeat()   # ✅ FIX
+        dataset = dataset.repeat()   
     else:
         dataset = dataset.cache()
 
