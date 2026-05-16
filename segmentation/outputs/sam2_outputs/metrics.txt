@@ -1,0 +1,5 @@
+===== FINAL METRICS =====
+loss: 0.5193
+dice_coefficient: 0.9083
+iou_score: 0.8337
+pixel_accuracy: 0.8373

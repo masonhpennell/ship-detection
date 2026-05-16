@@ -15,17 +15,28 @@ class Config:
     IMAGE_SIZE = (256, 256)
     BATCH_SIZE = 8
     EPOCHS = 5
-    DATASET_PATH = "dataset"
-    IMAGE_DIR = os.path.join(DATASET_PATH, "images")
-    MASK_DIR = os.path.join(DATASET_PATH, "masks")
+
+    # For sam2 annotations
+    #DATASET_PATH = "dataset"
+    #IMAGE_DIR = os.path.join(DATASET_PATH, "images")
+    #MASK_DIR = os.path.join(DATASET_PATH, "masks")
+    # For hand-annotations
+    IMAGE_DIR = os.path.join("handmade - images")
+    MASK_DIR = os.path.join("handmade masks")
+
     VAL_SPLIT = 0.2
     AUTOTUNE = tf.data.AUTOTUNE
     NUM_CLASSES = 1  # Binary segmentation
     LEARNING_RATE = 1e-4
     SEED = 42
     MODEL_PATH = "unet_model.h5"
-    FINE_TUNED = True # set True For part D
+    FINE_TUNED = False # set True For part D
     TRANSFER_LEARNING = False # set False For part B
+
+    OUTPUT_DIR = "test_outputs"
+    PLOTS_DIR = os.path.join(OUTPUT_DIR, "plots")
+    PREDICTIONS_DIR = os.path.join(OUTPUT_DIR, "predictions")
+    METRICS_FILE = os.path.join(OUTPUT_DIR, "metrics.txt")
 
 
 # =========================================================
@@ -215,6 +226,13 @@ def iou_score(y_true, y_pred, smooth=1e-6):
     return (intersection + smooth) / (union + smooth)
 
 
+def pixel_accuracy(y_true, y_pred):
+    y_pred = tf.cast(y_pred > 0.5, tf.float32)
+
+    correct = tf.cast(tf.equal(y_true, y_pred), tf.float32)
+    return tf.reduce_mean(correct)
+
+
 # =========================================================
 # VISUALIZATION
 # =========================================================
@@ -271,9 +289,79 @@ def predict_single_image(model, image_path):
 
 
 # =========================================================
+# BEST / WORST PREDICTIONS
+# =========================================================
+def compute_single_iou(y_true, y_pred, smooth=1e-6):
+    y_pred = (y_pred > 0.5).astype(np.float32)
+
+    intersection = np.sum(y_true * y_pred)
+    union = np.sum(y_true) + np.sum(y_pred) - intersection
+
+    return (intersection + smooth) / (union + smooth)
+
+
+def visualize_best_worst(model, dataset, num_examples=3):
+    scored_examples = []
+
+    for images, masks in dataset:
+        preds = model.predict(images, verbose=0)
+
+        for i in range(len(images)):
+            image = images[i].numpy()
+            mask = masks[i].numpy()
+            pred = preds[i]
+
+            score = compute_single_iou(mask, pred)
+
+            scored_examples.append((score, image, mask, pred))
+
+    scored_examples.sort(key=lambda x: x[0])
+
+    worst = scored_examples[:num_examples]
+    best = scored_examples[-num_examples:]
+
+    print("\n===== WORST PREDICTIONS =====")
+    display_examples(worst, "worst")
+
+    print("\n===== BEST PREDICTIONS =====")
+    display_examples(best, "best")
+
+
+def display_examples(examples, prefix):
+    for idx, (score, image, mask, pred) in enumerate(examples):
+        plt.figure(figsize=(12,4))
+
+        plt.subplot(1,3,1)
+        plt.imshow(image)
+        plt.title("Image")
+        plt.axis("off")
+
+        plt.subplot(1,3,2)
+        plt.imshow(mask.squeeze(), cmap="gray")
+        plt.title("Ground Truth")
+        plt.axis("off")
+
+        plt.subplot(1,3,3)
+        plt.imshow((pred.squeeze() > 0.5), cmap="gray")
+        plt.title(f"Prediction\nIoU={score:.3f}")
+        plt.axis("off")
+
+        save_path = os.path.join(
+            Config.PREDICTIONS_DIR,
+            f"{prefix}_{idx+1}.png"
+        )
+
+        plt.savefig(save_path, bbox_inches="tight")
+        plt.close()
+
+
+# =========================================================
 # MAIN PIPELINE
 # =========================================================
 def main():
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    os.makedirs(Config.PLOTS_DIR, exist_ok=True)
+    os.makedirs(Config.PREDICTIONS_DIR, exist_ok=True)
     tf.random.set_seed(Config.SEED)
     random.seed(Config.SEED)
 
@@ -299,7 +387,7 @@ def main():
     model.compile(
         optimizer=keras.optimizers.Adam(Config.LEARNING_RATE),
         loss="binary_crossentropy",
-        metrics=[dice_coefficient, iou_score]
+        metrics=[dice_coefficient, iou_score, pixel_accuracy]
     )
 
     print("Training...")
@@ -313,8 +401,50 @@ def main():
         steps_per_epoch=steps_per_epoch,
     )
 
+    # =========================================================
+    # TRAINING CURVES
+    # =========================================================
+    def plot_training_history(history):
+        metrics = [
+            "loss",
+            "dice_coefficient",
+            "iou_score",
+            "pixel_accuracy"
+        ]
+
+        for metric in metrics:
+            plt.figure(figsize=(6,4))
+
+            plt.plot(history.history[metric], label=f"Train {metric}")
+            plt.plot(history.history[f"val_{metric}"], label=f"Val {metric}")
+
+            plt.title(metric)
+            plt.xlabel("Epoch")
+            plt.ylabel(metric)
+            plt.legend()
+            save_path = os.path.join(
+                Config.PLOTS_DIR,
+                f"{metric}.png"
+            )
+
+            plt.savefig(save_path, bbox_inches="tight")
+            plt.close()
+
     print("Evaluating...")
-    model.evaluate(val_ds)
+    results = model.evaluate(val_ds, return_dict=True)
+
+    print("\n===== FINAL METRICS =====")
+
+    with open(Config.METRICS_FILE, "w") as f:
+        f.write("===== FINAL METRICS =====\n")
+
+        for key, value in results.items():
+            line = f"{key}: {value:.4f}"
+
+            print(line)
+            f.write(line + "\n")
+    plot_training_history(history)
+    visualize_best_worst(model, val_ds)
 
     # print("Displaying predictions...")
     # display_predictions(model, val_ds)
