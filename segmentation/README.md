@@ -32,3 +32,8 @@ Assignment 2 Contributions:
 - Jack: Created synthetic masks and 99% of pipeline
 - Mason: Hand annotated masks, Write-up, Transfer Learning implementation
 - Spencer: Evaluation
+
+Assignment 3 Contributions:
+- Jack: Handmade training masks, base pipeline code, sam2 generated masks
+- Mason: Handmade training masks, Transfer learning, ReadMe
+- Spencer: Handmade training masks, Evaluation + Report
